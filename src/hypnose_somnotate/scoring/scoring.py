@@ -29,6 +29,63 @@ UNDEFINED_MODEL_LABEL = 0
 UNDEFINED_OUTPUT_LABEL = MODEL_TO_OUTPUT_LABEL.get(UNDEFINED_MODEL_LABEL, 3)
 
 
+def _load_annotator(model_path: Path) -> StateAnnotator:
+    annotator = StateAnnotator()
+    annotator.load(str(model_path))
+    return annotator
+
+
+def score_recording(
+    edf_path: Path,
+    model: Path | StateAnnotator,
+    *,
+    channel_labels: list[str] | None = None,
+    sampling_rate_hz: float = DEFAULT_SAMPLING_RATE_HZ,
+    global_normalization: bool = False,
+) -> tuple[pd.DataFrame, PreparedRecording]:
+    """Score one EDF recording, given only the file itself and a trained model.
+
+    This is the layout-unaware core of the scoring pipeline: no subject/session
+    directory conventions, no derivatives root, no opinion about which of
+    several files in a folder should be scored -- just "here is one EDF, here
+    is a model, give me predictions for it". `score_recordings` (below) is a
+    batch wrapper built on top of this that adds exactly those layout
+    decisions via `io.paths.find_recordings`; a caller with its own
+    file-discovery and concatenation-preference logic -- e.g.
+    hypnose-eeg-analysis's `scripts/sleep_scoring/score_recordings.py` -- can
+    call this directly instead and own those decisions itself.
+
+    model
+        Either a path to a trained ``model.pickle``, or an already-loaded
+        `StateAnnotator`. Pass a loaded annotator when scoring many
+        recordings with the same model, to load the pickle once rather than
+        once per call.
+
+    Returns
+    -------
+    (predictions_df, prepared)
+        The same per-epoch DataFrame and `PreparedRecording` gap/chunk plan
+        that `score_recordings` writes to the predictions parquet and
+        segments JSON, respectively.
+    """
+    channel_labels = channel_labels or DEFAULT_CHANNEL_LABELS
+    annotator = model if isinstance(model, StateAnnotator) else _load_annotator(model)
+
+    raw_signals = load_raw_signals(str(edf_path), channel_labels)
+    prepared = prepare_recording(
+        raw_signals,
+        sampling_rate_hz=sampling_rate_hz,
+        time_resolution_s=time_resolution,
+    )
+    df = _score_prepared_recording(
+        prepared,
+        annotator,
+        sampling_rate_hz=sampling_rate_hz,
+        global_normalization=global_normalization,
+    )
+    return df, prepared
+
+
 def score_recordings(
     subjids: list[int | str],
     model_path: Path,
@@ -52,16 +109,16 @@ def score_recordings(
         repo_root, subjids, dates=dates, date_range=date_range, output_subdir=output_subdir
     )
 
-    annotator = StateAnnotator()
-    annotator.load(str(model_path))
+    annotator = _load_annotator(model_path)
 
     output_paths: list[Path] = []
     for recording in recordings:
-        raw_signals = load_raw_signals(str(recording.edf_path), channel_labels)
-        prepared = prepare_recording(
-            raw_signals,
+        df, prepared = score_recording(
+            recording.edf_path,
+            annotator,
+            channel_labels=channel_labels,
             sampling_rate_hz=sampling_rate_hz,
-            time_resolution_s=time_resolution,
+            global_normalization=global_normalization,
         )
         _print_recording_plan(recording, prepared)
         if global_normalization:
@@ -74,12 +131,6 @@ def score_recordings(
         output_path = prediction_path(recording)
         sidecar_path = segments_path(recording)
 
-        df = _score_prepared_recording(
-            prepared,
-            annotator,
-            sampling_rate_hz=sampling_rate_hz,
-            global_normalization=global_normalization,
-        )
         df.to_parquet(output_path, index=False)
         with open(sidecar_path, "w") as f:
             json.dump(prepared.to_dict(), f, indent=2)
