@@ -123,9 +123,24 @@ def _load_edf_file(file_path, signal_labels=None):
     return signals
 
 
+def _channel_label_alias(label):
+    """The other spelling of a channel label -- with or without its modality prefix.
+
+    Recordings are inconsistent about this: most raw EDFs name channels
+    ``EEG EEG1A-B`` / ``EMG EMG``, but some derived files (e.g. concatenated
+    recordings) drop the repeated prefix down to ``EEG1A-B`` / ``EMG``.
+    """
+    for prefix in ("EEG ", "EMG "):
+        if label.startswith(prefix):
+            return label[len(prefix):]
+    modality = "EMG" if label.upper().startswith("EMG") else "EEG"
+    return "{} {}".format(modality, label)
+
+
 def _load_edf_channels(signal_labels, edf_reader):
 
-    indices = [idx for idx in range(edf_reader.signals_in_file) if ensure_str(edf_reader.signal_label(idx)).strip() in signal_labels]
+    accepted = set(signal_labels) | {_channel_label_alias(label) for label in signal_labels}
+    indices = [idx for idx in range(edf_reader.signals_in_file) if ensure_str(edf_reader.signal_label(idx)).strip() in accepted]
 
     # assert len(indices) == len(signal_labels), "Could not recover all given signals."
     if len(indices) != len(signal_labels):
