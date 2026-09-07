@@ -42,12 +42,65 @@ from ...somnotate._utils import (
     robust_normalize,
 )
 
+def compute_log_spectrogram(raw_signal, sampling_frequency_in_hz,
+                             time_resolution_in_sec = 1,
+                             low_cut                = 1.,
+                             high_cut               = 90.,
+                             notch_low_cut          = 45.,
+                             notch_high_cut         = 55.,
+):
+    """Spectrogram of `raw_signal`, log-transformed, before normalization.
+
+    Split out of `preprocess` so callers can pool the (pre-normalization)
+    spectrogram across several signals -- e.g. every scoring chunk of a
+    recording -- before deciding what to normalize against. See
+    `preprocessing.preprocessing.compute_global_normalization_stats`.
+
+    Returns:
+    --------
+    time, frequencies -- as returned by `get_spectrogram`, after the
+        low/high-cut and notch frequency masks have been applied.
+
+    log_spectrogram -- (total frequencies, total samples / (sampling
+        frequency * time resolution)) ndarray
+        The log-transformed, not-yet-normalized spectrogram.
+    """
+    sampling_frequency_in_hz = float(sampling_frequency_in_hz)
+    nperseg = int(round(sampling_frequency_in_hz * time_resolution_in_sec))
+    frequencies, time, spectrogram = get_spectrogram(raw_signal,
+                                                     fs       = sampling_frequency_in_hz,
+                                                     nperseg  = nperseg,
+                                                     noverlap = 0)
+
+    # exclude ill-determined frequencies
+    mask = (frequencies >= low_cut) & (frequencies < high_cut)
+    frequencies = frequencies[mask]
+    spectrogram = spectrogram[mask]
+
+    # exclude noise-contaminated frequencies around 50 Hz;
+    # this improves performance (generally, 0.1-0.5%, but 3% in at least one case)
+    mask = (frequencies >= notch_low_cut) & (frequencies <= notch_high_cut)
+    frequencies = frequencies[~mask]
+    spectrogram = spectrogram[~mask]
+
+    # the power in each frequency band tends to be log-normally distributed, and
+    # taking the log hence transforms the distribution of power values to a normal distribution;
+    # shift power values by +1 such that values close to zero remain close to zero
+    # (and do not become large, negative values after log transformation)
+    spectrogram = np.log(spectrogram + 1)
+
+    return time, frequencies, spectrogram
+
+
 def preprocess(raw_signal, sampling_frequency_in_hz,
                time_resolution_in_sec   = 1,
                low_cut                  = 1.,
                high_cut                 = 90.,
                notch_low_cut            = 45.,
                notch_high_cut           = 55.,
+               robust_mean              = None,
+               robust_std               = None,
+               p                        = 5.,
 ):
     """Wrapper around get_spectrogram, that
     1) computes the spectrogram for the given LFP/EEG/EMG trace,
@@ -74,6 +127,19 @@ def preprocess(raw_signal, sampling_frequency_in_hz,
         The frequency band for which NOT to compute the power
         (to eliminate 50 Hz noise from the output signal).
 
+    robust_mean, robust_std -- (total frequencies,) ndarray or None (default None)
+        If given (both must be given together), these replace the per-call
+        percentile-trimmed mean/std that would otherwise be computed from this
+        `raw_signal` alone -- e.g. statistics pooled across an entire
+        recording's scoring chunks (see
+        `preprocessing.preprocessing.compute_global_normalization_stats`), so
+        that every chunk of a recording is normalized against the same
+        baseline rather than each against its own.
+
+    p -- float (default 5.)
+        Percentile-trim parameter for the robust standard score, used only
+        when `robust_mean`/`robust_std` are not supplied.
+
     Returns:
     --------
     preprocessed_signal -- (total samples / (sampling frequency * time resolution), total frequencies)
@@ -81,33 +147,32 @@ def preprocess(raw_signal, sampling_frequency_in_hz,
 
     """
 
-    # compute spectrogram
-    sampling_frequency_in_hz = float(sampling_frequency_in_hz)
-    nperseg = int(round(sampling_frequency_in_hz * time_resolution_in_sec))
-    frequencies, time, spectrogram = get_spectrogram(raw_signal,
-                                                     fs       = sampling_frequency_in_hz,
-                                                     nperseg  = nperseg,
-                                                     noverlap = 0)
+    time, frequencies, spectrogram = compute_log_spectrogram(
+        raw_signal, sampling_frequency_in_hz,
+        time_resolution_in_sec = time_resolution_in_sec,
+        low_cut                = low_cut,
+        high_cut               = high_cut,
+        notch_low_cut          = notch_low_cut,
+        notch_high_cut         = notch_high_cut,
+    )
 
-    # exclude ill-determined frequencies
-    mask = (frequencies >= low_cut) & (frequencies < high_cut)
-    frequencies = frequencies[mask]
-    spectrogram = spectrogram[mask]
-
-    # exclude noise-contaminated frequencies around 50 Hz;
-    # this improves performance (generally, 0.1-0.5%, but 3% in at least one case)
-    mask = (frequencies >= notch_low_cut) & (frequencies <= notch_high_cut)
-    frequencies = frequencies[~mask]
-    spectrogram = spectrogram[~mask]
-
-    # the power in each frequency band tends to be log-normally distributed, and
-    # taking the log hence transforms the distribution of power values to a normal distribution;
-    # shift power values by +1 such that values close to zero remain close to zero
-    # (and do not become large, negative values after log transformation)
-    spectrogram = np.log(spectrogram + 1)
-
-    # normalize the data by de-meaning and rescaling by the standard deviation
-    spectrogram = robust_normalize(spectrogram, p=5., axis=1, method='standard score')
+    if robust_mean is not None or robust_std is not None:
+        if robust_mean is None or robust_std is None:
+            raise ValueError("robust_mean and robust_std must both be given, or neither.")
+        robust_mean = np.asarray(robust_mean)
+        robust_std = np.asarray(robust_std)
+        if robust_mean.shape != (spectrogram.shape[0],) or robust_std.shape != (spectrogram.shape[0],):
+            raise ValueError(
+                "robust_mean/robust_std must have shape "
+                f"({spectrogram.shape[0]},) to match the {spectrogram.shape[0]} "
+                f"retained frequency bins; got {robust_mean.shape} and {robust_std.shape}."
+            )
+        # de-mean and rescale using the supplied (e.g. recording-wide) statistics
+        spectrogram = (spectrogram - robust_mean[:, np.newaxis]) / robust_std[:, np.newaxis]
+    else:
+        # normalize the data by de-meaning and rescaling by the standard deviation,
+        # using statistics computed from this call's own spectrogram
+        spectrogram = robust_normalize(spectrogram, p=p, axis=1, method='standard score')
 
     return time, frequencies, spectrogram
 

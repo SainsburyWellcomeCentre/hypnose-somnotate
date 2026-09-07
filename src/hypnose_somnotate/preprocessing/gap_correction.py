@@ -97,6 +97,28 @@ class PreparedRecording:
         }
 
 
+def epoch_kinds(prepared: "PreparedRecording") -> np.ndarray:
+    """Per-epoch ``kind`` ("signal" / "gap" / "too_short") for the entire original recording.
+
+    Built from `prepared.segments`, at `prepared.time_resolution_s` resolution.
+    Shared by scoring (to mask non-signal epochs out of the model output) and
+    by global-normalization statistics (to exclude non-signal epochs from the
+    pooled robust mean/std) so the two never disagree about which epochs are
+    real signal.
+    """
+    time_res = prepared.time_resolution_s
+    total_seconds = sum(s.duration_s for s in prepared.segments)
+    n_epochs = int(round(total_seconds / time_res))
+
+    kinds = np.empty(n_epochs, dtype=object)
+    kinds[:] = "gap"
+    for seg in prepared.segments:
+        start_ep = int(round(seg.original_start_s / time_res))
+        stop_ep = int(round(seg.original_end_s / time_res))
+        kinds[start_ep:stop_ep] = seg.kind
+    return kinds
+
+
 def _detect_constant_runs(
     raw_signals: np.ndarray,
     missing_value_identifier: Optional[float] = None,

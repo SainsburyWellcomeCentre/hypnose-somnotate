@@ -18,10 +18,10 @@ from ..config import (
     MODEL_TO_OUTPUT_LABEL,
     PROBABILITY_JSON_KEYS,
 )
-from ..preprocessing.gap_correction import PreparedRecording, prepare_recording
+from ..preprocessing.gap_correction import PreparedRecording, epoch_kinds, prepare_recording
 from ..io.loading import hypnogram_path, prediction_path, segments_path
 from ..io.paths import find_recordings, get_derivatives_root
-from ..preprocessing.preprocessing import preprocess_multichannel
+from ..preprocessing.preprocessing import compute_global_normalization_stats, preprocess_multichannel
 from ..somnotate_pipeline.utils import configuration
 
 
@@ -38,6 +38,8 @@ def score_recordings(
     channel_labels: list[str] | None = None,
     export_visbrain: bool = True,
     sampling_rate_hz: int = DEFAULT_SAMPLING_RATE_HZ,
+    output_subdir: str = "saved_results",
+    global_normalization: bool = False,
 ) -> list[Path]:
     derivatives_root = get_derivatives_root(repo_root)
     if not derivatives_root.exists():
@@ -46,7 +48,9 @@ def score_recordings(
         )
 
     channel_labels = channel_labels or DEFAULT_CHANNEL_LABELS
-    recordings = find_recordings(repo_root, subjids, dates=dates, date_range=date_range)
+    recordings = find_recordings(
+        repo_root, subjids, dates=dates, date_range=date_range, output_subdir=output_subdir
+    )
 
     annotator = StateAnnotator()
     annotator.load(str(model_path))
@@ -60,6 +64,8 @@ def score_recordings(
             time_resolution_s=time_resolution,
         )
         _print_recording_plan(recording, prepared)
+        if global_normalization:
+            print("  Normalization: global (pooled across all scoring chunks, gap/too_short epochs excluded)")
 
         output_dir = recording.output_dir
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -72,6 +78,7 @@ def score_recordings(
             prepared,
             annotator,
             sampling_rate_hz=sampling_rate_hz,
+            global_normalization=global_normalization,
         )
         df.to_parquet(output_path, index=False)
         with open(sidecar_path, "w") as f:
@@ -95,12 +102,23 @@ def _score_prepared_recording(
     prepared: PreparedRecording,
     annotator: StateAnnotator,
     sampling_rate_hz: float,
+    *,
+    global_normalization: bool = False,
 ) -> pd.DataFrame:
     """Run the model on each scoring chunk and assemble a per-epoch DataFrame.
 
     Output covers the entire original recording in epoch time. Epochs that fall
     in ``gap`` or ``too_short`` segments are filled with the undefined label and
     zero probabilities.
+
+    global_normalization
+        If True, every chunk is normalized against one set of robust
+        mean/std statistics pooled across all of ``prepared.scoring_chunks``
+        (gap/too_short epochs excluded) instead of each chunk's own
+        statistics -- see
+        ``preprocessing.preprocessing.compute_global_normalization_stats``.
+        Matters most for the ``split`` strategy, where several independent
+        chunks would otherwise each get their own baseline.
     """
     time_res = prepared.time_resolution_s
     total_seconds = sum(s.duration_s for s in prepared.segments)
@@ -109,8 +127,7 @@ def _score_prepared_recording(
     label_model = np.full(n_epochs, UNDEFINED_MODEL_LABEL, dtype=int)
     label_output = np.full(n_epochs, UNDEFINED_OUTPUT_LABEL, dtype=int)
     segment_ids = np.full(n_epochs, -1, dtype=int)
-    kinds = np.empty(n_epochs, dtype=object)
-    kinds[:] = "gap"
+    kinds = epoch_kinds(prepared)
 
     prob_columns: dict[str, np.ndarray] = {
         "prob_wake": np.zeros(n_epochs, dtype=float),
@@ -129,10 +146,17 @@ def _score_prepared_recording(
         start_ep = int(round(seg.original_start_s / time_res))
         stop_ep = int(round(seg.original_end_s / time_res))
         segment_ids[start_ep:stop_ep] = seg.segment_id
-        kinds[start_ep:stop_ep] = seg.kind
+
+    normalization_stats = (
+        compute_global_normalization_stats(prepared, sampling_rate_hz)
+        if global_normalization
+        else None
+    )
 
     for chunk in prepared.scoring_chunks:
-        preprocessed = preprocess_multichannel(chunk.raw_signal, sampling_rate_hz)
+        preprocessed = preprocess_multichannel(
+            chunk.raw_signal, sampling_rate_hz, normalization_stats=normalization_stats
+        )
         chunk_predicted = np.abs(np.asarray(annotator.predict(preprocessed), dtype=int))
         chunk_probs = _predict_state_probabilities(annotator, preprocessed)
 
