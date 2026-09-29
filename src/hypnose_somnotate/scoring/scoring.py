@@ -42,6 +42,7 @@ def score_recording(
     channel_labels: list[str] | None = None,
     sampling_rate_hz: float = DEFAULT_SAMPLING_RATE_HZ,
     global_normalization: bool = False,
+    exclude_intervals_s: list[tuple[float, float]] | None = None,
 ) -> tuple[pd.DataFrame, PreparedRecording]:
     """Score one EDF recording, given only the file itself and a trained model.
 
@@ -60,6 +61,11 @@ def score_recording(
         `StateAnnotator`. Pass a loaded annotator when scoring many
         recordings with the same model, to load the pickle once rather than
         once per call.
+    exclude_intervals_s
+        Optional ``(start_s, end_s)`` intervals, in seconds from the start of
+        the recording, to leave unscored (e.g. long artifact periods). They are
+        handled like detected gaps -- trimmed, masked or split around, and kept
+        out of normalization -- and labelled undefined with kind ``artifact``.
 
     Returns
     -------
@@ -76,6 +82,7 @@ def score_recording(
         raw_signals,
         sampling_rate_hz=sampling_rate_hz,
         time_resolution_s=time_resolution,
+        exclude_intervals_s=exclude_intervals_s,
     )
     df = _score_prepared_recording(
         prepared,
@@ -159,13 +166,13 @@ def _score_prepared_recording(
     """Run the model on each scoring chunk and assemble a per-epoch DataFrame.
 
     Output covers the entire original recording in epoch time. Epochs that fall
-    in ``gap`` or ``too_short`` segments are filled with the undefined label and
+    in ``gap``, ``artifact`` or ``too_short`` segments are filled with the undefined label and
     zero probabilities.
 
     global_normalization
         If True, every chunk is normalized against one set of robust
         mean/std statistics pooled across all of ``prepared.scoring_chunks``
-        (gap/too_short epochs excluded) instead of each chunk's own
+        (gap/artifact/too_short epochs excluded) instead of each chunk's own
         statistics -- see
         ``preprocessing.preprocessing.compute_global_normalization_stats``.
         Matters most for the ``split`` strategy, where several independent
@@ -279,6 +286,7 @@ def _print_recording_plan(recording, prepared: PreparedRecording) -> None:
     strategy = prepared.strategy
     strategy_desc = _STRATEGY_DESCRIPTIONS.get(strategy, "")
     gap_segs = [s for s in prepared.segments if s.kind == "gap"]
+    artifact_segs = [s for s in prepared.segments if s.kind == "artifact"]
     too_short_segs = [s for s in prepared.segments if s.kind == "too_short"]
 
     print(f"[{recording.subject} {recording.session} date-{recording.date}] {recording.edf_path.name}")
@@ -309,7 +317,7 @@ def _print_recording_plan(recording, prepared: PreparedRecording) -> None:
                 marker = f"  -> chunk {chunk_idx}"
             else:
                 marker = "  (within chunk 1)"
-        elif seg.kind == "too_short":
+        elif seg.kind in ("artifact", "too_short"):
             marker = "  (not scored)"
         print(
             f"    [{start:>8d} -> {stop:>8d} s]  {seg.kind:<10s} "
@@ -321,7 +329,12 @@ def _print_recording_plan(recording, prepared: PreparedRecording) -> None:
             f"  Note: {len(too_short_segs)} segment(s) marked too_short "
             "(below min_segment_length_s) and will be filled as undefined."
         )
-    if not gap_segs and strategy != "all_missing":
+    if artifact_segs:
+        print(
+            f"  Note: {len(artifact_segs)} segment(s) excluded as artifact "
+            "and will be filled as undefined."
+        )
+    if not gap_segs and not artifact_segs and strategy != "all_missing":
         print("  No gaps detected.")
 
 
