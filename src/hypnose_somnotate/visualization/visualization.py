@@ -139,13 +139,16 @@ def _stacked_signal_plot(
     colors: list[str],
     linewidth: float = 0.8,
     show_range: bool = True,
+    value_axis_bands: set[int] | None = None,
 ) -> None:
     """Plot multiple signals on one axis, stacked vertically with per-signal colors.
 
     First signal in the list ends up at the top of the plot (matches plot_signals convention).
-    Signal names are drawn as vertical (top-to-bottom) tick labels to save width; when
-    `show_range` is set, each band is annotated with the value at its top and bottom edge
-    (the 1st/99th-percentile scaling bounds) so absolute scale stays readable.
+    Signal names are drawn as vertical (top-to-bottom) tick labels to save width. Bands
+    whose input index is in `value_axis_bands` get numeric y-axis ticks on the right
+    edge (values at 10/50/90% of the band's 1st–99th-percentile scaling range); when
+    `show_range` is set, every other band is annotated with the value at its top and
+    bottom edge so absolute scale stays readable.
     """
     from matplotlib.transforms import blended_transform_factory
 
@@ -163,6 +166,7 @@ def _stacked_signal_plot(
     colors_rev = colors[::-1]
     lo_rev = lo[::-1]
     hi_rev = hi[::-1]
+    span_rev = span[::-1]
 
     # vertical offsets so signals don't overlap
     offsets = np.arange(arr.shape[1], dtype=float)
@@ -175,12 +179,17 @@ def _stacked_signal_plot(
         ax.plot(time, arr[:, i], color=colors_rev[i], linewidth=linewidth)
         ax.axhline(offsets[i] + 0.5, color="0.85", linewidth=0.5, linestyle=":")
 
+    # input index -> reversed (plotted) index
+    value_axis_rev = {arr.shape[1] - 1 - i for i in (value_axis_bands or ())}
+
     if show_range:
         # numeric scale bounds pinned to the right edge, one pair per band; the value
         # at the top of the band (hi) and at the bottom (lo). Uses the full-recording
         # percentiles the bands are normalized against.
         trans = blended_transform_factory(ax.transAxes, ax.transData)
         for i in range(arr.shape[1]):
+            if i in value_axis_rev:
+                continue
             ax.text(0.998, offsets[i] + 0.96, f"{hi_rev[i]:.3g}", transform=trans,
                     ha="right", va="top", fontsize=6, color="0.45")
             ax.text(0.998, offsets[i] + 0.04, f"{lo_rev[i]:.3g}", transform=trans,
@@ -188,6 +197,23 @@ def _stacked_signal_plot(
 
     ax.set_yticks(offsets + 0.5)
     ax.set_yticklabels(labels_rev, rotation=-90, va="center")
+
+    if value_axis_rev:
+        # Real axis values for the selected bands, as right-side minor ticks. Positions
+        # stay inside the band so neighbouring bands' ticks never collide.
+        fractions = (0.1, 0.5, 0.9)
+        tick_pos, tick_labels = [], []
+        for i in sorted(value_axis_rev):
+            for frac in fractions:
+                tick_pos.append(offsets[i] + frac)
+                tick_labels.append(f"{lo_rev[i] + frac * span_rev[i]:.3g}")
+        # the 50% tick shares its position with the band's name tick; keep both
+        ax.yaxis.remove_overlapping_locs = False
+        ax.set_yticks(tick_pos, minor=True)
+        ax.set_yticklabels(tick_labels, minor=True)
+        ax.tick_params(axis="y", which="minor", left=False, labelleft=False,
+                       right=True, labelright=True, labelsize=7, colors="0.3")
+
     ax.set_xlim(time[0], time[-1])
 
 
@@ -261,14 +287,14 @@ def plot_detailed_comparison(
     td_ratio = theta_env / (delta_env + 1e-6)
 
     signals = [eeg_disp, emg_disp, emg_rms, delta_env, theta_env, td_ratio]
-    smoothing_suffix = f", {band_smoothing_window_s:g}s" if band_smoothing_window_s else ""
+    # Short names: the long band/window descriptions overlapped as rotated tick labels.
     labels = [
         f"EEG{eeg_channel + 1} (raw)",
         "EMG (raw)",
-        f"EMG RMS ({emg_rms_window_s:g}s)",
-        f"Delta ({delta_band[0]:g}-{delta_band[1]:g} Hz{smoothing_suffix})",
-        f"Theta ({theta_band[0]:g}-{theta_band[1]:g} Hz{smoothing_suffix})",
-        f"T:D ratio{smoothing_suffix}" if smoothing_suffix else "T:D ratio",
+        "EMG RMS",
+        "Delta",
+        "Theta",
+        "T:D Ratio",
     ]
     colors = ["green", "green", "orange", "pink", "red", "blue"]
 
@@ -280,7 +306,8 @@ def plot_detailed_comparison(
     data_axis = fig.add_subplot(gs[0, 0])
     auto_axis = fig.add_subplot(gs[1, 0], sharex=data_axis)
     manual_axes = [fig.add_subplot(gs[i + 2, 0], sharex=data_axis) for i in range(len(selected))]
-    fig.tight_layout(**{"rect": [0.05, 0, 1, 1], "pad": 2.0, "h_pad": 0.6})
+    # Right margin leaves room for the derived channels' y-axis values.
+    fig.tight_layout(**{"rect": [0.05, 0, 0.95, 1], "pad": 2.0, "h_pad": 0.6})
 
     _stacked_signal_plot(
         data_axis,
@@ -289,6 +316,7 @@ def plot_detailed_comparison(
         labels=labels,
         colors=colors,
         linewidth=0.8,
+        value_axis_bands={2, 3, 4, 5},
     )
 
     auto_states, auto_intervals = convert_state_vector_to_state_intervals(

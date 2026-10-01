@@ -124,11 +124,54 @@ def reload(repo_root: Path | None = None) -> None:
     _locations(repo_root).reload()
 
 
+def _prefer_concatenated_recording(
+    edf_paths: list[Path], *, sub_label: str, session: str, date: str
+) -> list[Path]:
+    """When a session's ephys/ folder has multiple EDFs, score only the concatenated one.
+
+    The glob in `find_recordings` matches every EDF that looks like a recording for
+    this session -- both the original per-part files and a
+    `_recording-concat.edf` produced by concatenating them (see
+    `scripts/preprocessing/concatenate_recordings.py` in hypnose-eeg-analysis).
+    Without this filter, a multi-part session gets scored once per original part
+    *and* once for the concatenation: duplicated work, and the individual parts get
+    scored with none of `prepare_recording`'s gap-aware handling between them
+    (there's no real gap between two files scored independently -- they just look
+    like two separate, shorter recordings).
+
+    If more than one EDF is present but none of them is a concatenated recording,
+    the session is skipped (with a warning) rather than falling back to scoring the
+    individual parts -- mirrors `EdfDownsampler._prefer_concatenated_recordings` in
+    hypnose-eeg-analysis's `scripts/preprocessing/downsample_recordings.py`.
+    """
+    if len(edf_paths) <= 1:
+        return edf_paths
+
+    concat_paths = [
+        path
+        for path in edf_paths
+        if path.name.lower().endswith("recording-concat.edf")
+        or "_recording-concat" in path.name.lower()
+    ]
+    if not concat_paths:
+        warnings.warn(
+            f"{sub_label} {session} (date {date}) has {len(edf_paths)} EDF files "
+            "but none is a concatenated recording ('_recording-concat.edf'); "
+            "skipping until scripts/preprocessing/concatenate_recordings.py has "
+            "been run for this session.",
+            UserWarning,
+            stacklevel=2,
+        )
+        return []
+    return concat_paths
+
+
 def find_recordings(
     repo_root: Path,
     subjids: Iterable[int | str],
     dates: Iterable[int | str] | None = None,
     date_range: tuple[int | str, int | str] | None = None,
+    output_subdir: str = "saved_results",
 ) -> list[RecordingRef]:
     raw_root = get_raw_root(repo_root)
     derivatives_root = get_derivatives_root(repo_root)
@@ -190,12 +233,18 @@ def find_recordings(
                     )
                 continue
 
+            edf_paths = _prefer_concatenated_recording(
+                edf_paths, sub_label=sub_label, session=session, date=date
+            )
+            if not edf_paths:
+                continue  # warning already issued by _prefer_concatenated_recording
+
             for edf_path in edf_paths:
                 output_dir = (
                     derivatives_root
                     / subject_dir.name
                     / session_dir.name
-                    / "saved_results"
+                    / output_subdir
                 )
                 results.append(
                     RecordingRef(

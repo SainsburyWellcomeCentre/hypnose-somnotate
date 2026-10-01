@@ -18,15 +18,98 @@ from ..config import (
     MODEL_TO_OUTPUT_LABEL,
     PROBABILITY_JSON_KEYS,
 )
-from ..preprocessing.gap_correction import PreparedRecording, prepare_recording
+from ..preprocessing.gap_correction import (
+    DEFAULT_MAX_SINGLE_GAP_S,
+    DEFAULT_MIN_SEGMENT_LENGTH_S,
+    PreparedRecording,
+    epoch_kinds,
+    prepare_recording,
+)
 from ..io.loading import hypnogram_path, prediction_path, segments_path
 from ..io.paths import find_recordings, get_derivatives_root
-from ..preprocessing.preprocessing import preprocess_multichannel
+from ..preprocessing.preprocessing import compute_global_normalization_stats, preprocess_multichannel
 from ..somnotate_pipeline.utils import configuration
 
 
 UNDEFINED_MODEL_LABEL = 0
 UNDEFINED_OUTPUT_LABEL = MODEL_TO_OUTPUT_LABEL.get(UNDEFINED_MODEL_LABEL, 3)
+
+
+def _load_annotator(model_path: Path) -> StateAnnotator:
+    annotator = StateAnnotator()
+    annotator.load(str(model_path))
+    return annotator
+
+
+def score_recording(
+    edf_path: Path,
+    model: Path | StateAnnotator,
+    *,
+    channel_labels: list[str] | None = None,
+    sampling_rate_hz: float = DEFAULT_SAMPLING_RATE_HZ,
+    global_normalization: bool = False,
+    exclude_intervals_s: list[tuple[float, float]] | None = None,
+    max_single_gap_s: float = DEFAULT_MAX_SINGLE_GAP_S,
+    min_segment_length_s: float = DEFAULT_MIN_SEGMENT_LENGTH_S,
+) -> tuple[pd.DataFrame, PreparedRecording]:
+    """Score one EDF recording, given only the file itself and a trained model.
+
+    This is the layout-unaware core of the scoring pipeline: no subject/session
+    directory conventions, no derivatives root, no opinion about which of
+    several files in a folder should be scored -- just "here is one EDF, here
+    is a model, give me predictions for it". `score_recordings` (below) is a
+    batch wrapper built on top of this that adds exactly those layout
+    decisions via `io.paths.find_recordings`; a caller with its own
+    file-discovery and concatenation-preference logic -- e.g.
+    hypnose-eeg-analysis's `scripts/sleep_scoring/score_recordings.py` -- can
+    call this directly instead and own those decisions itself.
+
+    model
+        Either a path to a trained ``model.pickle``, or an already-loaded
+        `StateAnnotator`. Pass a loaded annotator when scoring many
+        recordings with the same model, to load the pickle once rather than
+        once per call.
+    exclude_intervals_s
+        Optional ``(start_s, end_s)`` intervals, in seconds from the start of
+        the recording, to leave unscored (e.g. long artifact periods). They are
+        handled like detected gaps -- trimmed, masked or split around, and kept
+        out of normalization -- and labelled undefined with kind ``artifact``.
+    max_single_gap_s
+        Middle gaps (including excluded intervals) longer than this split the
+        recording into separately scored chunks; shorter ones are scored
+        through and masked as undefined. See
+        ``preprocessing.gap_correction.prepare_recording``.
+    min_segment_length_s
+        Chunks (or whole recordings) shorter than this are left unscored and
+        labelled undefined with kind ``too_short`` -- too little context for
+        the HMM.
+
+    Returns
+    -------
+    (predictions_df, prepared)
+        The same per-epoch DataFrame and `PreparedRecording` gap/chunk plan
+        that `score_recordings` writes to the predictions parquet and
+        segments JSON, respectively.
+    """
+    channel_labels = channel_labels or DEFAULT_CHANNEL_LABELS
+    annotator = model if isinstance(model, StateAnnotator) else _load_annotator(model)
+
+    raw_signals = load_raw_signals(str(edf_path), channel_labels)
+    prepared = prepare_recording(
+        raw_signals,
+        sampling_rate_hz=sampling_rate_hz,
+        time_resolution_s=time_resolution,
+        exclude_intervals_s=exclude_intervals_s,
+        max_single_gap_s=max_single_gap_s,
+        min_segment_length_s=min_segment_length_s,
+    )
+    df = _score_prepared_recording(
+        prepared,
+        annotator,
+        sampling_rate_hz=sampling_rate_hz,
+        global_normalization=global_normalization,
+    )
+    return df, prepared
 
 
 def score_recordings(
@@ -38,6 +121,10 @@ def score_recordings(
     channel_labels: list[str] | None = None,
     export_visbrain: bool = True,
     sampling_rate_hz: int = DEFAULT_SAMPLING_RATE_HZ,
+    output_subdir: str = "saved_results",
+    global_normalization: bool = False,
+    max_single_gap_s: float = DEFAULT_MAX_SINGLE_GAP_S,
+    min_segment_length_s: float = DEFAULT_MIN_SEGMENT_LENGTH_S,
 ) -> list[Path]:
     derivatives_root = get_derivatives_root(repo_root)
     if not derivatives_root.exists():
@@ -46,20 +133,26 @@ def score_recordings(
         )
 
     channel_labels = channel_labels or DEFAULT_CHANNEL_LABELS
-    recordings = find_recordings(repo_root, subjids, dates=dates, date_range=date_range)
+    recordings = find_recordings(
+        repo_root, subjids, dates=dates, date_range=date_range, output_subdir=output_subdir
+    )
 
-    annotator = StateAnnotator()
-    annotator.load(str(model_path))
+    annotator = _load_annotator(model_path)
 
     output_paths: list[Path] = []
     for recording in recordings:
-        raw_signals = load_raw_signals(str(recording.edf_path), channel_labels)
-        prepared = prepare_recording(
-            raw_signals,
+        df, prepared = score_recording(
+            recording.edf_path,
+            annotator,
+            channel_labels=channel_labels,
             sampling_rate_hz=sampling_rate_hz,
-            time_resolution_s=time_resolution,
+            global_normalization=global_normalization,
+            max_single_gap_s=max_single_gap_s,
+            min_segment_length_s=min_segment_length_s,
         )
         _print_recording_plan(recording, prepared)
+        if global_normalization:
+            print("  Normalization: global (pooled across all scoring chunks, gap/too_short epochs excluded)")
 
         output_dir = recording.output_dir
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -68,11 +161,6 @@ def score_recordings(
         output_path = prediction_path(recording)
         sidecar_path = segments_path(recording)
 
-        df = _score_prepared_recording(
-            prepared,
-            annotator,
-            sampling_rate_hz=sampling_rate_hz,
-        )
         df.to_parquet(output_path, index=False)
         with open(sidecar_path, "w") as f:
             json.dump(prepared.to_dict(), f, indent=2)
@@ -95,12 +183,23 @@ def _score_prepared_recording(
     prepared: PreparedRecording,
     annotator: StateAnnotator,
     sampling_rate_hz: float,
+    *,
+    global_normalization: bool = False,
 ) -> pd.DataFrame:
     """Run the model on each scoring chunk and assemble a per-epoch DataFrame.
 
     Output covers the entire original recording in epoch time. Epochs that fall
-    in ``gap`` or ``too_short`` segments are filled with the undefined label and
+    in ``gap``, ``artifact`` or ``too_short`` segments are filled with the undefined label and
     zero probabilities.
+
+    global_normalization
+        If True, every chunk is normalized against one set of robust
+        mean/std statistics pooled across all of ``prepared.scoring_chunks``
+        (gap/artifact/too_short epochs excluded) instead of each chunk's own
+        statistics -- see
+        ``preprocessing.preprocessing.compute_global_normalization_stats``.
+        Matters most for the ``split`` strategy, where several independent
+        chunks would otherwise each get their own baseline.
     """
     time_res = prepared.time_resolution_s
     total_seconds = sum(s.duration_s for s in prepared.segments)
@@ -109,8 +208,7 @@ def _score_prepared_recording(
     label_model = np.full(n_epochs, UNDEFINED_MODEL_LABEL, dtype=int)
     label_output = np.full(n_epochs, UNDEFINED_OUTPUT_LABEL, dtype=int)
     segment_ids = np.full(n_epochs, -1, dtype=int)
-    kinds = np.empty(n_epochs, dtype=object)
-    kinds[:] = "gap"
+    kinds = epoch_kinds(prepared)
 
     prob_columns: dict[str, np.ndarray] = {
         "prob_wake": np.zeros(n_epochs, dtype=float),
@@ -129,10 +227,17 @@ def _score_prepared_recording(
         start_ep = int(round(seg.original_start_s / time_res))
         stop_ep = int(round(seg.original_end_s / time_res))
         segment_ids[start_ep:stop_ep] = seg.segment_id
-        kinds[start_ep:stop_ep] = seg.kind
+
+    normalization_stats = (
+        compute_global_normalization_stats(prepared, sampling_rate_hz)
+        if global_normalization
+        else None
+    )
 
     for chunk in prepared.scoring_chunks:
-        preprocessed = preprocess_multichannel(chunk.raw_signal, sampling_rate_hz)
+        preprocessed = preprocess_multichannel(
+            chunk.raw_signal, sampling_rate_hz, normalization_stats=normalization_stats
+        )
         chunk_predicted = np.abs(np.asarray(annotator.predict(preprocessed), dtype=int))
         chunk_probs = _predict_state_probabilities(annotator, preprocessed)
 
@@ -187,7 +292,7 @@ def _score_prepared_recording(
 _STRATEGY_DESCRIPTIONS = {
     "trim_only": "trim leading/trailing gaps, score the contiguous middle",
     "mask_inline": "score the kept range as one chunk, mark middle gaps as undefined post-hoc",
-    "split": "split into independent chunks at long middle gaps, fill gaps with undefined",
+    "split": "split into independent chunks at long middle gaps, mark all gaps as undefined",
     "all_missing": "no scorable signal in this recording (skipping)",
 }
 
@@ -204,6 +309,7 @@ def _print_recording_plan(recording, prepared: PreparedRecording) -> None:
     strategy = prepared.strategy
     strategy_desc = _STRATEGY_DESCRIPTIONS.get(strategy, "")
     gap_segs = [s for s in prepared.segments if s.kind == "gap"]
+    artifact_segs = [s for s in prepared.segments if s.kind == "artifact"]
     too_short_segs = [s for s in prepared.segments if s.kind == "too_short"]
 
     print(f"[{recording.subject} {recording.session} date-{recording.date}] {recording.edf_path.name}")
@@ -220,21 +326,23 @@ def _print_recording_plan(recording, prepared: PreparedRecording) -> None:
         return
 
     print(f"  Segments ({len(prepared.segments)}):")
-    chunk_ranges = {
-        (int(round(c.original_start_s)), int(round(c.original_end_s))): idx + 1
-        for idx, c in enumerate(prepared.scoring_chunks)
-    }
     for seg in prepared.segments:
         start = int(round(seg.original_start_s))
         stop = int(round(seg.original_end_s))
         marker = ""
         if seg.kind == "signal":
-            chunk_idx = chunk_ranges.get((start, stop))
+            chunk_idx = next(
+                (
+                    idx + 1
+                    for idx, c in enumerate(prepared.scoring_chunks)
+                    if c.original_start_s <= seg.original_start_s
+                    and seg.original_end_s <= c.original_end_s
+                ),
+                None,
+            )
             if chunk_idx is not None:
                 marker = f"  -> chunk {chunk_idx}"
-            else:
-                marker = "  (within chunk 1)"
-        elif seg.kind == "too_short":
+        elif seg.kind in ("artifact", "too_short"):
             marker = "  (not scored)"
         print(
             f"    [{start:>8d} -> {stop:>8d} s]  {seg.kind:<10s} "
@@ -246,7 +354,12 @@ def _print_recording_plan(recording, prepared: PreparedRecording) -> None:
             f"  Note: {len(too_short_segs)} segment(s) marked too_short "
             "(below min_segment_length_s) and will be filled as undefined."
         )
-    if not gap_segs and strategy != "all_missing":
+    if artifact_segs:
+        print(
+            f"  Note: {len(artifact_segs)} segment(s) excluded as artifact "
+            "and will be filled as undefined."
+        )
+    if not gap_segs and not artifact_segs and strategy != "all_missing":
         print("  No gaps detected.")
 
 

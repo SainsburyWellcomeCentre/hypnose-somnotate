@@ -12,24 +12,46 @@ one of three strategies, chosen automatically:
 
 - ``trim_only``: missing data is only at the leading/trailing edges; trim it
   and score the contiguous middle.
-- ``mask_inline``: small middle gaps (total <= ``max_missing_fraction`` and
-  longest single gap <= ``max_single_gap_s``); score the whole kept range as
-  one chunk and overwrite gap epochs as undefined in the output.
-- ``split``: at least one middle gap is large; split the kept range at each
-  gap boundary, score each contiguous chunk independently, fill gaps with
-  undefined.
+- ``mask_inline``: every middle gap is short (<= ``max_single_gap_s``); score
+  the whole kept range as one chunk and overwrite gap epochs as undefined in
+  the output.
+- ``split``: at least one middle gap is long (> ``max_single_gap_s``); split the
+  kept range at each long gap only, score each chunk independently, and mask
+  the short gaps inside each chunk as in ``mask_inline``.
+
+Under every strategy, a chunk shorter than ``min_segment_length_s`` is not
+scored -- too little context for the HMM -- and its signal is labelled
+``too_short``. A recording whose kept range is itself that short is therefore
+left entirely unscored.
+
+The decision is made per gap, by duration alone -- there is no total-missing-
+fraction trigger, since short zero-filled gaps are kept out of normalization by
+global normalization (``preprocessing.compute_global_normalization_stats``)
+rather than by splitting around them.
+
+Callers can also pass ``exclude_intervals_s`` -- stretches known to be unusable
+for another reason, e.g. long artifact periods from a pre-scoring scan. These
+are handled exactly like detected gaps when choosing the strategy (trimmed,
+masked or split around, and kept out of normalization), but are labelled
+``artifact`` rather than ``gap`` so the two causes stay distinguishable.
 
 All cut points are snapped to integer seconds (floor at start, ceil at end of
-each detected gap) so the epoch grid is preserved end-to-end.
+each detected gap or excluded interval) so the epoch grid is preserved
+end-to-end.
 """
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Sequence
 
 import numpy as np
+
+# Middle gaps longer than this split a recording into separately scored chunks.
+DEFAULT_MAX_SINGLE_GAP_S = 30 * 60
+# Chunks shorter than this are left unscored (``too_short``).
+DEFAULT_MIN_SEGMENT_LENGTH_S = 10 * 60
 
 
 @dataclass
@@ -37,7 +59,7 @@ class RecordingSegment:
     """A non-overlapping slice of the original recording timeline."""
 
     segment_id: int
-    kind: str  # "signal" | "gap" | "too_short"
+    kind: str  # "signal" | "gap" | "artifact" | "too_short"
     original_start_s: float
     original_end_s: float
 
@@ -60,8 +82,8 @@ class ScoringChunk:
     """A contiguous block of raw signal that should be fed to the model.
 
     A single chunk may span several ``RecordingSegment`` entries (this happens
-    in the ``mask_inline`` strategy, where one chunk covers the entire kept
-    range and the middle gaps inside it are masked post-hoc).
+    in the ``mask_inline`` and ``split`` strategies, where short middle gaps
+    inside a chunk are masked post-hoc rather than split around).
     """
 
     original_start_s: float
@@ -95,6 +117,28 @@ class PreparedRecording:
             "time_resolution_s": float(self.time_resolution_s),
             "segments": [s.to_dict() for s in self.segments],
         }
+
+
+def epoch_kinds(prepared: "PreparedRecording") -> np.ndarray:
+    """Per-epoch ``kind`` ("signal" / "gap" / "artifact" / "too_short") for the entire original recording.
+
+    Built from `prepared.segments`, at `prepared.time_resolution_s` resolution.
+    Shared by scoring (to mask non-signal epochs out of the model output) and
+    by global-normalization statistics (to exclude non-signal epochs from the
+    pooled robust mean/std) so the two never disagree about which epochs are
+    real signal.
+    """
+    time_res = prepared.time_resolution_s
+    total_seconds = sum(s.duration_s for s in prepared.segments)
+    n_epochs = int(round(total_seconds / time_res))
+
+    kinds = np.empty(n_epochs, dtype=object)
+    kinds[:] = "gap"
+    for seg in prepared.segments:
+        start_ep = int(round(seg.original_start_s / time_res))
+        stop_ep = int(round(seg.original_end_s / time_res))
+        kinds[start_ep:stop_ep] = seg.kind
+    return kinds
 
 
 def _detect_constant_runs(
@@ -148,15 +192,45 @@ def _merge_overlapping(intervals: list[tuple[int, int]]) -> list[tuple[int, int]
     return merged
 
 
+def _missing_pieces(
+    start_s: int, stop_s: int, excluded: list[tuple[int, int]]
+) -> list[tuple[str, int, int]]:
+    """Split the missing range ``[start_s, stop_s)`` into ``(kind, start, stop)`` pieces.
+
+    Parts covered by ``excluded`` (sorted, non-overlapping) are ``artifact``;
+    the rest is ``gap``.
+    """
+    pieces: list[tuple[str, int, int]] = []
+    cursor = start_s
+    for ex_start, ex_stop in excluded:
+        ex_start, ex_stop = max(ex_start, start_s), min(ex_stop, stop_s)
+        if ex_stop <= ex_start:
+            continue
+        if ex_start > cursor:
+            pieces.append(("gap", cursor, ex_start))
+        pieces.append(("artifact", ex_start, ex_stop))
+        cursor = ex_stop
+    if cursor < stop_s:
+        pieces.append(("gap", cursor, stop_s))
+    return pieces
+
+
 def _all_missing(
     duration_int_s: int,
     original_duration_s: float,
     sampling_rate_hz: float,
     time_resolution_s: float,
+    excluded: list[tuple[int, int]] | None = None,
 ) -> PreparedRecording:
-    seg = RecordingSegment(0, "gap", 0.0, float(duration_int_s))
+    pieces = _missing_pieces(0, duration_int_s, excluded or []) or [
+        ("gap", 0, duration_int_s)
+    ]
+    segments = [
+        RecordingSegment(seg_id, kind, float(start), float(stop))
+        for seg_id, (kind, start, stop) in enumerate(pieces)
+    ]
     return PreparedRecording(
-        segments=[seg],
+        segments=segments,
         scoring_chunks=[],
         strategy="all_missing",
         original_duration_s=original_duration_s,
@@ -173,11 +247,11 @@ def prepare_recording(
     sampling_rate_hz: float,
     *,
     time_resolution_s: float = 1.0,
-    max_missing_fraction: float = 0.05,
-    max_single_gap_s: float = 30 * 60,
-    min_segment_length_s: float = 10 * 60,
+    max_single_gap_s: float = DEFAULT_MAX_SINGLE_GAP_S,
+    min_segment_length_s: float = DEFAULT_MIN_SEGMENT_LENGTH_S,
     min_missing_run_s: float = 1.0,
     missing_value_identifier: Optional[float] = None,
+    exclude_intervals_s: Optional[Sequence[tuple[float, float]]] = None,
 ) -> PreparedRecording:
     """Detect non-recorded periods and prepare a recording for scoring.
 
@@ -189,26 +263,28 @@ def prepare_recording(
         Sampling rate of the raw signals.
     time_resolution_s
         Epoch length in seconds (matches ``configuration.time_resolution``).
-    max_missing_fraction
-        Above this fraction of total kept duration spent in middle gaps, the
-        strategy switches from ``mask_inline`` to ``split``. Defaulting to
-        ``0.05`` matches the percentile-trim parameter ``p=5`` used by
-        somnotate's ``robust_normalize``: gaps below this fraction are absorbed
-        by the trim and don't bias normalization.
     max_single_gap_s
-        Any single middle gap longer than this forces ``split`` regardless of
-        the total fraction. Reason: even with normalization OK, the HMM forward-
-        backward pass will run over the gap's garbage samples and can pull
-        nearby real epochs around through state-transition smoothing.
+        Middle gaps longer than this split the recording into separately scored
+        chunks; shorter ones are scored through and masked as undefined.
+        Reason: the HMM forward-backward pass runs over a masked gap's garbage
+        samples and can pull nearby real epochs around through state-transition
+        smoothing, which matters more the longer the gap.
     min_segment_length_s
-        Signal chunks shorter than this (in the ``split`` strategy) are marked
-        as ``too_short`` and not scored — too little context for the HMM.
+        Chunks shorter than this are not scored, under every strategy -- too
+        little context for the HMM; their signal is marked ``too_short``. A
+        short recording (or one whose kept range is short) is a single short
+        chunk, so it is left unscored entirely.
     min_missing_run_s
         Constant-value runs shorter than this are ignored as not-really-missing
         (could be brief flat artefacts in real data).
     missing_value_identifier
         If supplied, only runs of *this exact value* are treated as missing.
         Otherwise any constant run qualifies.
+    exclude_intervals_s
+        Extra ``(start_s, end_s)`` intervals, in seconds from the start of the
+        recording, to leave unscored -- e.g. long artifact periods. They count
+        as missing data for the strategy decision and are labelled
+        ``artifact`` (where they overlap a detected gap, ``artifact`` wins).
 
     Returns
     -------
@@ -216,7 +292,8 @@ def prepare_recording(
         Holds:
 
         - ``segments``: non-overlapping segments covering the *entire* original
-          recording, classified as ``signal`` / ``gap`` / ``too_short``.
+          recording, classified as ``signal`` / ``gap`` / ``artifact`` /
+          ``too_short``.
         - ``scoring_chunks``: the contiguous raw-signal blocks to feed the
           model (empty for ``all_missing``).
         - Strategy and summary statistics.
@@ -257,6 +334,16 @@ def prepare_recording(
             snapped.append((start_s, stop_s))
     snapped = _merge_overlapping(snapped)
 
+    # Caller-supplied exclusions, snapped the same way, count as missing too.
+    excluded: list[tuple[int, int]] = []
+    for start_s, stop_s in exclude_intervals_s or ():
+        start_s = max(0, int(math.floor(start_s)))
+        stop_s = min(duration_int_s, int(math.ceil(stop_s)))
+        if stop_s > start_s:
+            excluded.append((start_s, stop_s))
+    excluded = _merge_overlapping(excluded)
+    snapped = _merge_overlapping(snapped + excluded)
+
     # 3. Separate leading / trailing / middle.
     keep_start_s = 0
     keep_end_s = duration_int_s
@@ -270,25 +357,20 @@ def prepare_recording(
 
     if keep_end_s <= keep_start_s:
         return _all_missing(
-            duration_int_s, original_duration_s, sampling_rate_hz, time_resolution_s
+            duration_int_s,
+            original_duration_s,
+            sampling_rate_hz,
+            time_resolution_s,
+            excluded,
         )
 
-    # 4. Decide strategy.
-    kept_duration_s = keep_end_s - keep_start_s
-    total_middle_missing_s = sum(stop - start for start, stop in middle_gaps)
-    longest_middle_gap_s = max(
-        (stop - start for start, stop in middle_gaps), default=0
-    )
-    middle_missing_fraction = (
-        total_middle_missing_s / kept_duration_s if kept_duration_s > 0 else 0.0
-    )
-
+    # 4. Decide strategy: only middle gaps longer than max_single_gap_s split.
+    split_gaps = [
+        (start, stop) for start, stop in middle_gaps if stop - start > max_single_gap_s
+    ]
     if not middle_gaps:
         strategy = "trim_only"
-    elif (
-        middle_missing_fraction > max_missing_fraction
-        or longest_middle_gap_s > max_single_gap_s
-    ):
+    elif split_gaps:
         strategy = "split"
     else:
         strategy = "mask_inline"
@@ -298,73 +380,62 @@ def prepare_recording(
     scoring_chunks: list[ScoringChunk] = []
     seg_id = 0
 
+    def _append_missing(start_s: int, stop_s: int) -> None:
+        nonlocal seg_id
+        for kind, piece_start, piece_stop in _missing_pieces(start_s, stop_s, excluded):
+            segments.append(RecordingSegment(seg_id, kind, piece_start, piece_stop))
+            seg_id += 1
+
     def _slice_signal(start_s: int, stop_s: int) -> np.ndarray:
         start_sample = int(round(start_s * sampling_rate_hz))
         stop_sample = int(round(stop_s * sampling_rate_hz))
         return raw_signals[start_sample:stop_sample]
 
     if keep_start_s > 0:
-        segments.append(RecordingSegment(seg_id, "gap", 0, keep_start_s))
-        seg_id += 1
+        _append_missing(0, keep_start_s)
 
-    if strategy in ("trim_only", "mask_inline"):
-        # The whole kept range is fed to the model as one chunk so the HMM gets
-        # clean normalization. Middle gaps (in mask_inline) are recorded as
-        # separate gap segments and will be overwritten as undefined post-hoc.
-        cursor = keep_start_s
+    # Chunk boundaries are the long gaps. Short gaps inside a chunk are recorded
+    # as separate gap segments and overwritten as undefined post-hoc, while the
+    # chunk itself is fed to the model whole.
+    chunk_ranges: list[tuple[int, int]] = []
+    cursor = keep_start_s
+    for gap_start, gap_stop in split_gaps:
+        chunk_ranges.append((cursor, gap_start))
+        cursor = gap_stop
+    chunk_ranges.append((cursor, keep_end_s))
+
+    for chunk_index, (chunk_start, chunk_stop) in enumerate(chunk_ranges):
+        if chunk_index > 0:
+            _append_missing(*split_gaps[chunk_index - 1])
+        scored = chunk_stop - chunk_start >= min_segment_length_s
+        signal_kind = "signal" if scored else "too_short"
+        cursor = chunk_start
         for gap_start, gap_stop in middle_gaps:
+            if gap_start < chunk_start or gap_stop > chunk_stop:
+                continue
             if gap_start > cursor:
-                segments.append(
-                    RecordingSegment(seg_id, "signal", cursor, gap_start)
-                )
+                segments.append(RecordingSegment(seg_id, signal_kind, cursor, gap_start))
                 seg_id += 1
-            segments.append(RecordingSegment(seg_id, "gap", gap_start, gap_stop))
-            seg_id += 1
+            _append_missing(gap_start, gap_stop)
             cursor = gap_stop
-        if cursor < keep_end_s:
-            segments.append(RecordingSegment(seg_id, "signal", cursor, keep_end_s))
+        if cursor < chunk_stop:
+            segments.append(RecordingSegment(seg_id, signal_kind, cursor, chunk_stop))
             seg_id += 1
-        scoring_chunks.append(
-            ScoringChunk(
-                keep_start_s, keep_end_s, _slice_signal(keep_start_s, keep_end_s)
+        if scored:
+            scoring_chunks.append(
+                ScoringChunk(chunk_start, chunk_stop, _slice_signal(chunk_start, chunk_stop))
             )
-        )
-    else:  # split
-        cursor = keep_start_s
-        for gap_start, gap_stop in middle_gaps:
-            sig_duration = gap_start - cursor
-            if sig_duration > 0:
-                kind = "signal" if sig_duration >= min_segment_length_s else "too_short"
-                segments.append(RecordingSegment(seg_id, kind, cursor, gap_start))
-                if kind == "signal":
-                    scoring_chunks.append(
-                        ScoringChunk(cursor, gap_start, _slice_signal(cursor, gap_start))
-                    )
-                seg_id += 1
-            segments.append(RecordingSegment(seg_id, "gap", gap_start, gap_stop))
-            seg_id += 1
-            cursor = gap_stop
-        if cursor < keep_end_s:
-            sig_duration = keep_end_s - cursor
-            kind = "signal" if sig_duration >= min_segment_length_s else "too_short"
-            segments.append(RecordingSegment(seg_id, kind, cursor, keep_end_s))
-            if kind == "signal":
-                scoring_chunks.append(
-                    ScoringChunk(cursor, keep_end_s, _slice_signal(cursor, keep_end_s))
-                )
-            seg_id += 1
 
     if keep_end_s < duration_int_s:
-        segments.append(RecordingSegment(seg_id, "gap", keep_end_s, duration_int_s))
-        seg_id += 1
+        _append_missing(keep_end_s, duration_int_s)
 
     # 6. Stats over the entire original recording.
     total_missing_s = sum(
-        s.duration_s for s in segments if s.kind in ("gap", "too_short")
+        s.duration_s for s in segments if s.kind in ("gap", "artifact", "too_short")
     )
     missing_fraction = total_missing_s / duration_int_s
     longest_gap_s = max(
-        (s.duration_s for s in segments if s.kind == "gap"), default=0
+        (s.duration_s for s in segments if s.kind in ("gap", "artifact")), default=0
     )
 
     return PreparedRecording(
