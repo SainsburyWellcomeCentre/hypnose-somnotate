@@ -88,9 +88,11 @@ def score_recording(
         typically pooled from a longer recording of the same animal (see
         ``recording_normalization_stats``), for recordings too short to
         provide a representative baseline themselves. May also be a callable
-        taking the `PreparedRecording` and returning such a list, or None to
-        fall back to `global_normalization` -- so the choice can depend on
-        how much signal the recording turns out to have. Which statistics
+        taking the `PreparedRecording` and the recording's own pooled
+        statistics and returning such a list, or None to fall back to
+        `global_normalization` -- so the choice can depend on how much signal
+        the recording turns out to have and how far it sits from a candidate
+        reference. Which statistics
         were used is recorded on the returned ``prepared.normalization``.
     exclude_intervals_s
         Optional ``(start_s, end_s)`` intervals, in seconds from the start of

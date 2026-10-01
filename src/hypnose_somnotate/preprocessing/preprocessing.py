@@ -24,8 +24,11 @@ ROBUST_TRIM_PERCENT = 5.0
 NormalizationStats = tuple[np.ndarray, np.ndarray]
 ChannelStats = list[Union[NormalizationStats, None]]
 # A fixed set of per-channel stats, or a callable that picks them once the
-# recording's gap/chunk plan is known (returning None to fall back).
-StatsSource = Union[ChannelStats, Callable[[PreparedRecording], Union[ChannelStats, None]]]
+# recording's gap/chunk plan and its own pooled statistics are known
+# (returning None to fall back).
+StatsSource = Union[
+    ChannelStats, Callable[[PreparedRecording, ChannelStats], Union[ChannelStats, None]]
+]
 
 NORMALIZATION_STATS_FORMAT = "hypnose-somnotate-normalization/1"
 
@@ -274,8 +277,8 @@ def resolve_normalization(
 ) -> NormalizationResult:
     """Decide which statistics a recording's scoring chunks are normalized against.
 
-    `normalization_stats`, when it is (or, as a callable given `prepared`,
-    returns) a stats list, wins -- source ``"reference"``. Otherwise
+    `normalization_stats`, when it is (or, as a callable given `prepared` and
+    the recording's own pooled statistics, returns) a stats list, wins -- source ``"reference"``. Otherwise
     `global_normalization` selects the recording's own pooled statistics
     (``"self"``), and failing that each chunk is normalized on its own
     (``"local"``). The recording's own pooled statistics are computed in
@@ -283,7 +286,7 @@ def resolve_normalization(
     """
     own = compute_global_normalization_stats(prepared, sampling_rate_hz)
     external = (
-        normalization_stats(prepared) if callable(normalization_stats) else normalization_stats
+        normalization_stats(prepared, own) if callable(normalization_stats) else normalization_stats
     )
     if external is not None:
         source, applied = "reference", list(external)

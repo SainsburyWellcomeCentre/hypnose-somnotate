@@ -73,8 +73,9 @@ def test_resolve_normalization_callable_returning_none_falls_back() -> None:
     prepared = _prepared()
     seen = []
 
-    def resolver(candidate):
+    def resolver(candidate, own):
         seen.append(candidate)
+        assert len(own) == 3
         return None
 
     result = resolve_normalization(
@@ -166,7 +167,7 @@ def test_scoring_normalizes_chunks_against_the_supplied_reference() -> None:
     )
     df = _score_prepared_recording(
         ref_prepared, ref_annotator, SAMPLING_RATE_HZ,
-        global_normalization=True, normalization_stats=lambda prepared: reference,
+        global_normalization=True, normalization_stats=lambda prepared, own: reference,
     )
 
     assert own_prepared.normalization.source == "self"
