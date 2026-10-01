@@ -44,9 +44,12 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Optional, Sequence
+from typing import TYPE_CHECKING, Optional, Sequence
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from .preprocessing import NormalizationResult
 
 # Middle gaps longer than this split a recording into separately scored chunks.
 DEFAULT_MAX_SINGLE_GAP_S = 30 * 60
@@ -104,10 +107,12 @@ class PreparedRecording:
     longest_gap_s: float
     sampling_rate_hz: float
     time_resolution_s: float
+    # Set by scoring: which statistics the chunks were normalized against.
+    normalization: Optional["NormalizationResult"] = None
 
     def to_dict(self) -> dict:
         """JSON-serializable summary (no raw signal data)."""
-        return {
+        summary = {
             "strategy": self.strategy,
             "original_duration_s": float(self.original_duration_s),
             "total_missing_s": float(self.total_missing_s),
@@ -117,6 +122,9 @@ class PreparedRecording:
             "time_resolution_s": float(self.time_resolution_s),
             "segments": [s.to_dict() for s in self.segments],
         }
+        if self.normalization is not None:
+            summary["normalization"] = self.normalization.to_dict()
+        return summary
 
 
 def epoch_kinds(prepared: "PreparedRecording") -> np.ndarray:

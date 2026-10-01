@@ -309,6 +309,7 @@ def load_aligned_vectors(
 PREDICTIONS_SUFFIX = "_somnotate_predictions.parquet"
 SEGMENTS_SUFFIX = "_somnotate_segments.json"
 HYPNOGRAM_SUFFIX = "_somnotate_predictions.txt"
+NORMALIZATION_SUFFIX = "_somnotate_normalization.npz"
 
 
 def prediction_path(recording) -> Path:
@@ -324,6 +325,11 @@ def segments_path(recording) -> Path:
 def hypnogram_path(recording) -> Path:
     """Path to the visbrain hypnogram .txt for a resolved recording."""
     return recording.output_dir / f"{recording.edf_path.stem}{HYPNOGRAM_SUFFIX}"
+
+
+def normalization_stats_path(recording) -> Path:
+    """Path to the recording's own pooled normalization statistics (.npz)."""
+    return recording.output_dir / f"{recording.edf_path.stem}{NORMALIZATION_SUFFIX}"
 
 
 @dataclass(frozen=True)

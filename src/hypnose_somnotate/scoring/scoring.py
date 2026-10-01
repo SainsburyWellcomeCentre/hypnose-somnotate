@@ -25,9 +25,21 @@ from ..preprocessing.gap_correction import (
     epoch_kinds,
     prepare_recording,
 )
-from ..io.loading import hypnogram_path, prediction_path, segments_path
+from ..io.loading import (
+    hypnogram_path,
+    normalization_stats_path,
+    prediction_path,
+    segments_path,
+)
 from ..io.paths import find_recordings, get_derivatives_root
-from ..preprocessing.preprocessing import compute_global_normalization_stats, preprocess_multichannel
+from ..preprocessing.preprocessing import (
+    ChannelStats,
+    StatsSource,
+    compute_global_normalization_stats,
+    preprocess_multichannel,
+    resolve_normalization,
+    save_normalization_stats,
+)
 from ..somnotate_pipeline.utils import configuration
 
 
@@ -48,6 +60,7 @@ def score_recording(
     channel_labels: list[str] | None = None,
     sampling_rate_hz: float = DEFAULT_SAMPLING_RATE_HZ,
     global_normalization: bool = False,
+    normalization_stats: StatsSource | None = None,
     exclude_intervals_s: list[tuple[float, float]] | None = None,
     max_single_gap_s: float = DEFAULT_MAX_SINGLE_GAP_S,
     min_segment_length_s: float = DEFAULT_MIN_SEGMENT_LENGTH_S,
@@ -69,6 +82,18 @@ def score_recording(
         `StateAnnotator`. Pass a loaded annotator when scoring many
         recordings with the same model, to load the pickle once rather than
         once per call.
+    normalization_stats
+        Optional per-channel ``(robust_mean, robust_std)`` statistics to
+        normalize every chunk against instead of the recording's own --
+        typically pooled from a longer recording of the same animal (see
+        ``recording_normalization_stats``), for recordings too short to
+        provide a representative baseline themselves. May also be a callable
+        taking the `PreparedRecording` and the recording's own pooled
+        statistics and returning such a list, or None to fall back to
+        `global_normalization` -- so the choice can depend on how much signal
+        the recording turns out to have and how far it sits from a candidate
+        reference. Which statistics
+        were used is recorded on the returned ``prepared.normalization``.
     exclude_intervals_s
         Optional ``(start_s, end_s)`` intervals, in seconds from the start of
         the recording, to leave unscored (e.g. long artifact periods). They are
@@ -108,8 +133,38 @@ def score_recording(
         annotator,
         sampling_rate_hz=sampling_rate_hz,
         global_normalization=global_normalization,
+        normalization_stats=normalization_stats,
     )
     return df, prepared
+
+
+def recording_normalization_stats(
+    edf_path: Path,
+    *,
+    channel_labels: list[str] | None = None,
+    sampling_rate_hz: float = DEFAULT_SAMPLING_RATE_HZ,
+    exclude_intervals_s: list[tuple[float, float]] | None = None,
+    max_single_gap_s: float = DEFAULT_MAX_SINGLE_GAP_S,
+    min_segment_length_s: float = DEFAULT_MIN_SEGMENT_LENGTH_S,
+) -> tuple[ChannelStats, PreparedRecording]:
+    """A recording's own pooled normalization statistics, without scoring it.
+
+    The same statistics `score_recording` computes as ``prepared.normalization.own``
+    -- signal epochs only, after the same gap/artifact handling -- for a
+    recording scored before those were saved, or not scored at all. Pass the
+    same `exclude_intervals_s` and gap settings its scoring uses (or would use).
+    """
+    channel_labels = channel_labels or DEFAULT_CHANNEL_LABELS
+    raw_signals = load_raw_signals(str(edf_path), channel_labels)
+    prepared = prepare_recording(
+        raw_signals,
+        sampling_rate_hz=sampling_rate_hz,
+        time_resolution_s=time_resolution,
+        exclude_intervals_s=exclude_intervals_s,
+        max_single_gap_s=max_single_gap_s,
+        min_segment_length_s=min_segment_length_s,
+    )
+    return compute_global_normalization_stats(prepared, sampling_rate_hz), prepared
 
 
 def score_recordings(
@@ -151,8 +206,6 @@ def score_recordings(
             min_segment_length_s=min_segment_length_s,
         )
         _print_recording_plan(recording, prepared)
-        if global_normalization:
-            print("  Normalization: global (pooled across all scoring chunks, gap/too_short epochs excluded)")
 
         output_dir = recording.output_dir
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -164,6 +217,17 @@ def score_recordings(
         df.to_parquet(output_path, index=False)
         with open(sidecar_path, "w") as f:
             json.dump(prepared.to_dict(), f, indent=2)
+        if prepared.normalization is not None and prepared.normalization.own:
+            save_normalization_stats(
+                normalization_stats_path(recording),
+                prepared.normalization.own,
+                {
+                    "edf_name": recording.edf_path.name,
+                    "channel_labels": channel_labels,
+                    "sampling_rate_hz": float(sampling_rate_hz),
+                    "signal_s": prepared.normalization.signal_s,
+                },
+            )
 
         if export_visbrain:
             hyp_path = hypnogram_path(recording)
@@ -185,6 +249,7 @@ def _score_prepared_recording(
     sampling_rate_hz: float,
     *,
     global_normalization: bool = False,
+    normalization_stats: StatsSource | None = None,
 ) -> pd.DataFrame:
     """Run the model on each scoring chunk and assemble a per-epoch DataFrame.
 
@@ -200,6 +265,11 @@ def _score_prepared_recording(
         ``preprocessing.preprocessing.compute_global_normalization_stats``.
         Matters most for the ``split`` strategy, where several independent
         chunks would otherwise each get their own baseline.
+    normalization_stats
+        Statistics (or a callable choosing them) that take precedence over
+        both of the above -- see `score_recording`. The decision, and the
+        recording's own pooled statistics, are stored on
+        ``prepared.normalization``.
     """
     time_res = prepared.time_resolution_s
     total_seconds = sum(s.duration_s for s in prepared.segments)
@@ -228,15 +298,17 @@ def _score_prepared_recording(
         stop_ep = int(round(seg.original_end_s / time_res))
         segment_ids[start_ep:stop_ep] = seg.segment_id
 
-    normalization_stats = (
-        compute_global_normalization_stats(prepared, sampling_rate_hz)
-        if global_normalization
-        else None
+    normalization = resolve_normalization(
+        prepared,
+        sampling_rate_hz,
+        global_normalization=global_normalization,
+        normalization_stats=normalization_stats,
     )
+    prepared.normalization = normalization
 
     for chunk in prepared.scoring_chunks:
         preprocessed = preprocess_multichannel(
-            chunk.raw_signal, sampling_rate_hz, normalization_stats=normalization_stats
+            chunk.raw_signal, sampling_rate_hz, normalization_stats=normalization.applied
         )
         chunk_predicted = np.abs(np.asarray(annotator.predict(preprocessed), dtype=int))
         chunk_probs = _predict_state_probabilities(annotator, preprocessed)
@@ -294,6 +366,13 @@ _STRATEGY_DESCRIPTIONS = {
     "mask_inline": "score the kept range as one chunk, mark middle gaps as undefined post-hoc",
     "split": "split into independent chunks at long middle gaps, mark all gaps as undefined",
     "all_missing": "no scorable signal in this recording (skipping)",
+}
+
+
+_NORMALIZATION_DESCRIPTIONS = {
+    "reference": "statistics supplied by the caller (e.g. a longer recording of the same animal)",
+    "self": "pooled across all scoring chunks, gap/artifact/too_short epochs excluded",
+    "local": "each scoring chunk against its own statistics",
 }
 
 
@@ -361,6 +440,9 @@ def _print_recording_plan(recording, prepared: PreparedRecording) -> None:
         )
     if not gap_segs and not artifact_segs and strategy != "all_missing":
         print("  No gaps detected.")
+    if prepared.normalization is not None:
+        description = _NORMALIZATION_DESCRIPTIONS.get(prepared.normalization.source, "")
+        print(f"  Normalization: {prepared.normalization.source} — {description}")
 
 
 def _predict_state_probabilities(annotator: StateAnnotator, signal_array: np.ndarray) -> dict[int, np.ndarray]:
