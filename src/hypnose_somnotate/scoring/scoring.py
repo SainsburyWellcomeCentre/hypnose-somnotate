@@ -18,7 +18,13 @@ from ..config import (
     MODEL_TO_OUTPUT_LABEL,
     PROBABILITY_JSON_KEYS,
 )
-from ..preprocessing.gap_correction import PreparedRecording, epoch_kinds, prepare_recording
+from ..preprocessing.gap_correction import (
+    DEFAULT_MAX_SINGLE_GAP_S,
+    DEFAULT_MIN_SEGMENT_LENGTH_S,
+    PreparedRecording,
+    epoch_kinds,
+    prepare_recording,
+)
 from ..io.loading import hypnogram_path, prediction_path, segments_path
 from ..io.paths import find_recordings, get_derivatives_root
 from ..preprocessing.preprocessing import compute_global_normalization_stats, preprocess_multichannel
@@ -43,6 +49,8 @@ def score_recording(
     sampling_rate_hz: float = DEFAULT_SAMPLING_RATE_HZ,
     global_normalization: bool = False,
     exclude_intervals_s: list[tuple[float, float]] | None = None,
+    max_single_gap_s: float = DEFAULT_MAX_SINGLE_GAP_S,
+    min_segment_length_s: float = DEFAULT_MIN_SEGMENT_LENGTH_S,
 ) -> tuple[pd.DataFrame, PreparedRecording]:
     """Score one EDF recording, given only the file itself and a trained model.
 
@@ -66,6 +74,15 @@ def score_recording(
         the recording, to leave unscored (e.g. long artifact periods). They are
         handled like detected gaps -- trimmed, masked or split around, and kept
         out of normalization -- and labelled undefined with kind ``artifact``.
+    max_single_gap_s
+        Middle gaps (including excluded intervals) longer than this split the
+        recording into separately scored chunks; shorter ones are scored
+        through and masked as undefined. See
+        ``preprocessing.gap_correction.prepare_recording``.
+    min_segment_length_s
+        Chunks (or whole recordings) shorter than this are left unscored and
+        labelled undefined with kind ``too_short`` -- too little context for
+        the HMM.
 
     Returns
     -------
@@ -83,6 +100,8 @@ def score_recording(
         sampling_rate_hz=sampling_rate_hz,
         time_resolution_s=time_resolution,
         exclude_intervals_s=exclude_intervals_s,
+        max_single_gap_s=max_single_gap_s,
+        min_segment_length_s=min_segment_length_s,
     )
     df = _score_prepared_recording(
         prepared,
@@ -104,6 +123,8 @@ def score_recordings(
     sampling_rate_hz: int = DEFAULT_SAMPLING_RATE_HZ,
     output_subdir: str = "saved_results",
     global_normalization: bool = False,
+    max_single_gap_s: float = DEFAULT_MAX_SINGLE_GAP_S,
+    min_segment_length_s: float = DEFAULT_MIN_SEGMENT_LENGTH_S,
 ) -> list[Path]:
     derivatives_root = get_derivatives_root(repo_root)
     if not derivatives_root.exists():
@@ -126,6 +147,8 @@ def score_recordings(
             channel_labels=channel_labels,
             sampling_rate_hz=sampling_rate_hz,
             global_normalization=global_normalization,
+            max_single_gap_s=max_single_gap_s,
+            min_segment_length_s=min_segment_length_s,
         )
         _print_recording_plan(recording, prepared)
         if global_normalization:
@@ -269,7 +292,7 @@ def _score_prepared_recording(
 _STRATEGY_DESCRIPTIONS = {
     "trim_only": "trim leading/trailing gaps, score the contiguous middle",
     "mask_inline": "score the kept range as one chunk, mark middle gaps as undefined post-hoc",
-    "split": "split into independent chunks at long middle gaps, fill gaps with undefined",
+    "split": "split into independent chunks at long middle gaps, mark all gaps as undefined",
     "all_missing": "no scorable signal in this recording (skipping)",
 }
 
@@ -303,20 +326,22 @@ def _print_recording_plan(recording, prepared: PreparedRecording) -> None:
         return
 
     print(f"  Segments ({len(prepared.segments)}):")
-    chunk_ranges = {
-        (int(round(c.original_start_s)), int(round(c.original_end_s))): idx + 1
-        for idx, c in enumerate(prepared.scoring_chunks)
-    }
     for seg in prepared.segments:
         start = int(round(seg.original_start_s))
         stop = int(round(seg.original_end_s))
         marker = ""
         if seg.kind == "signal":
-            chunk_idx = chunk_ranges.get((start, stop))
+            chunk_idx = next(
+                (
+                    idx + 1
+                    for idx, c in enumerate(prepared.scoring_chunks)
+                    if c.original_start_s <= seg.original_start_s
+                    and seg.original_end_s <= c.original_end_s
+                ),
+                None,
+            )
             if chunk_idx is not None:
                 marker = f"  -> chunk {chunk_idx}"
-            else:
-                marker = "  (within chunk 1)"
         elif seg.kind in ("artifact", "too_short"):
             marker = "  (not scored)"
         print(
